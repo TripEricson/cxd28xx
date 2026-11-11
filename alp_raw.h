@@ -13,6 +13,7 @@
  *          (e.g. the alp%d network interface) needs it.
  * ioctl(): ALP_RAW_IOC_GET_L1 reads L1 signalling; it never claims the
  *          reader, so it can be used alongside a running capture.
+ *          ALP_RAW_IOC_SET_XFER sets the USB transfer size (see below).
  *
  * The device node is 0660 root:root unless a udev rule assigns a group;
  * 99-alpraw.rules gives it to group "video" like /dev/dvb.
@@ -43,5 +44,20 @@ struct alp_raw_l1 {
  * ENOSPC buffer too small, EOPNOTSUPP bridge can't read L1, ENODEV unplugged.
  */
 #define ALP_RAW_IOC_GET_L1	_IOWR(0xA3, 0x40, struct alp_raw_l1)
+
+/*
+ * Bridges hand over TS only in whole transfers, so a low-bitrate PLP decoded
+ * on its own can take minutes to fill a default (64 KB) one. SET_XFER asks
+ * for a smaller transfer, in 188-byte TS packets; 0 returns to the driver
+ * default. In: packets requested. Out: packets now in effect (the bridge
+ * clamps to its range, and with several tuners on one bridge the smallest
+ * request wins). Set it before the first read()/poll() starts the stream;
+ * a running stream takes a smaller size at once but a larger one only from
+ * its next start. The request lasts until this file is closed or makes
+ * another. GET_XFER only reports the size in effect.
+ * EOPNOTSUPP: the bridge has no adjustable transfer size.
+ */
+#define ALP_RAW_IOC_SET_XFER	_IOWR(0xA3, 0x41, __u32)
+#define ALP_RAW_IOC_GET_XFER	_IOR(0xA3, 0x42, __u32)
 
 #endif /* _ALP_RAW_H_ */

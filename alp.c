@@ -53,6 +53,7 @@ struct alp_dev {
 	bool                 dead;	/* detached: hardware gone */
 	spinlock_t           raw_fifo_lock;	/* writer side + raw_reader */
 	bool                 raw_reader;	/* a file is reading */
+	struct alp_raw_file *xfer_owner;	/* last SET_XFER, under raw_lock */
 	struct kfifo_rec_ptr_2 raw_fifo;	/* alp_raw_hdr + packet records */
 	void                *raw_fifo_buf;
 	u8                  *raw_scratch;
@@ -703,6 +704,7 @@ static void alp_setup(struct net_device *netdev)
 struct alp_raw_file {
 	struct alp_dev *alp;
 	bool reader;
+	bool xfer_set;		/* this file made a SET_XFER request */
 };
 
 static void alp_free(struct kref *ref)
@@ -790,6 +792,16 @@ static int alp_raw_release(struct inode *inode, struct file *f)
 	struct alp_dev *alp = rf->alp;
 	unsigned long flags;
 
+	if (rf->xfer_set) {
+		/* drop the request before the feed, so the next stream
+		 * (alp%d, say) starts at the default size */
+		mutex_lock(&alp->raw_lock);
+		if (!alp->dead && alp->xfer_owner == rf) {
+			alp->ops->set_xfer(alp->ops_priv, 0);
+			alp->xfer_owner = NULL;
+		}
+		mutex_unlock(&alp->raw_lock);
+	}
 	if (rf->reader) {
 		mutex_lock(&alp->raw_lock);
 		spin_lock_irqsave(&alp->raw_fifo_lock, flags);
@@ -862,6 +874,36 @@ static __poll_t alp_raw_poll(struct file *f, poll_table *wait)
 	return mask;
 }
 
+static long alp_raw_xfer_ioctl(struct alp_raw_file *rf, unsigned int cmd,
+			       u32 __user *uarg)
+{
+	struct alp_dev *alp = rf->alp;
+	u32 packets = U32_MAX;
+	int ret;
+
+	if (cmd == ALP_RAW_IOC_SET_XFER && get_user(packets, uarg))
+		return -EFAULT;
+	if (packets == U32_MAX && cmd == ALP_RAW_IOC_SET_XFER)
+		return -EINVAL;
+	if (!alp->ops || !alp->ops->set_xfer)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&alp->raw_lock);
+	if (alp->dead) {
+		ret = -ENODEV;
+	} else {
+		ret = alp->ops->set_xfer(alp->ops_priv, packets);
+		if (ret >= 0 && cmd == ALP_RAW_IOC_SET_XFER) {
+			rf->xfer_set = true;
+			alp->xfer_owner = packets ? rf : NULL;
+		}
+	}
+	mutex_unlock(&alp->raw_lock);
+	if (ret < 0)
+		return ret;
+	return put_user((u32)ret, uarg);
+}
+
 static long alp_raw_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
 	struct alp_raw_file *rf = f->private_data;
@@ -871,6 +913,8 @@ static long alp_raw_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	u32 len;
 	int ret;
 
+	if (cmd == ALP_RAW_IOC_SET_XFER || cmd == ALP_RAW_IOC_GET_XFER)
+		return alp_raw_xfer_ioctl(rf, cmd, (u32 __user *)arg);
 	if (cmd != ALP_RAW_IOC_GET_L1)
 		return -ENOTTY;
 	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))

@@ -72,6 +72,10 @@ struct alp_ops {
 	/* optional: read L1 signalling (ALP_RAW_L1_*) into buf; returns
 	 * bytes or -errno. Process context, may sleep. */
 	int  (*l1)(void *priv, u32 what, u8 *buf, u32 len);
+	/* optional: request a USB transfer size in TS packets (0 = default);
+	 * returns the size now in effect or -errno. With packets == U32_MAX,
+	 * only report it. Process context, may sleep. */
+	int  (*set_xfer)(void *priv, u32 packets);
 };
 
 /**

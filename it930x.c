@@ -57,7 +57,24 @@
 
 /* TS streaming */
 #define IT930X_URB_COUNT		8
-#define IT930X_URB_BUF_SIZE		(188 * 348)
+#define IT930X_URB_BUF_SIZE		(188 * 348)	/* largest transfer, and the default */
+#define IT930X_URB_MIN_PACKETS		4
+
+/*
+ * The bridge holds TS until it has a whole transfer's worth (register
+ * 0xdd88, in 4-byte units), so with low-rate output - one low-bitrate PLP
+ * decoded on its own - data can sit in it for minutes. Smaller transfers
+ * cut that delay at the cost of more USB transactions at high rates.
+ * The vendor's IT9300 code uses thresholds down to 21 packets.
+ *
+ * urb_packets is the default; a /dev/alpraw%d reader can ask for a smaller
+ * size for its stream (ALP_RAW_IOC_SET_XFER), which alp-capture does from
+ * the selected PLPs' bitrate. The size is applied whenever a stream starts.
+ */
+static unsigned int urb_packets = IT930X_URB_BUF_SIZE / 188;
+module_param(urb_packets, uint, 0644);
+MODULE_PARM_DESC(urb_packets,
+		 "Default TS packets per USB transfer, 4-348 (default 348 = 64 KB); applies from the next stream start");
 
 /* Bridge registers */
 #define IT930X_REG_CLK_DISABLE		0x4976
@@ -173,6 +190,7 @@ struct it930x_fe_ctx {
 	struct dvb_net		dvbnet;
 
 	int			feeding;
+	u32			xfer_req;	/* ALP_RAW_IOC_SET_XFER packets, 0 = none */
 
 	/* Hardware PID filter state */
 	u16			pid_table[IT930X_PID_FILTER_MAX];
@@ -222,7 +240,9 @@ struct it930x_dev {
 	struct urb *urbs[IT930X_URB_COUNT];
 	u8 *urb_bufs[IT930X_URB_COUNT];
 	dma_addr_t urb_dma[IT930X_URB_COUNT];
+	u32 urb_buf_size;	/* bytes per transfer now set in 0xdd88 */
 	bool streaming;
+	bool stream_dead;	/* disconnecting: no more starts */
 
 	/* Streaming stats */
 	unsigned long urb_complete_ok;
@@ -886,6 +906,38 @@ static int it930x_stage_fw_ready(struct it930x_dev *dev)
 	return 0;
 }
 
+/* Bridge transfer threshold (0xdd88, in 4-byte units). */
+static int it930x_write_xfer_size(struct it930x_dev *dev, u32 bytes)
+{
+	u8 dd88[2] = { bytes / 4 & 0xff, (bytes / 4 >> 8) & 0xff };
+
+	return it930x_write_regs(dev, 0xdd88, dd88, sizeof(dd88));
+}
+
+/*
+ * Transfer size for the next stream, in TS packets: the urb_packets default,
+ * or the smallest size a frontend's /dev/alpraw%d reader asked for. A smaller
+ * transfer never loses data, it only costs more USB completions.
+ */
+static u32 it930x_xfer_packets(struct it930x_dev *dev)
+{
+	u32 n = clamp_t(u32, READ_ONCE(urb_packets), IT930X_URB_MIN_PACKETS,
+			IT930X_URB_BUF_SIZE / 188);
+	int i;
+
+	for (i = 0; i < dev->board->num_frontends; i++)
+		if (dev->fes[i].xfer_req)
+			n = min(n, dev->fes[i].xfer_req);
+	/*
+	 * Keep transfers off a multiple of the bulk packet size (512, or 1024
+	 * at SuperSpeed), so each ends in a short packet: a running URB of the
+	 * old, larger size then completes on every smaller transfer.
+	 */
+	if (n % 128 == 0)
+		n--;
+	return n;
+}
+
 /*
  * Post-boot bridge configuration.
  * Key operations: I2C controller config, TS clock toggle, I2C slave
@@ -896,8 +948,6 @@ static int it930x_stage_post_boot(struct it930x_dev *dev)
 	const struct it930x_board_cfg *board = dev->board;
 	static const u32 addr_regs[] = { 0x4975, 0x4974, 0x4973, 0x4972, 0x4964 };
 	static const u32 bus_regs[]  = { 0x4971, 0x4970, 0x496f, 0x496e, 0x4963 };
-	u8 dd88[2] = { IT930X_URB_BUF_SIZE / 4 & 0xff,
-		       (IT930X_URB_BUF_SIZE / 4 >> 8) & 0xff };
 	u8 val;
 	int ret, i;
 
@@ -953,7 +1003,7 @@ static int it930x_stage_post_boot(struct it930x_dev *dev)
 		return ret;
 
 	/* DD88 / DD0C */
-	ret = it930x_write_regs(dev, 0xdd88, dd88, sizeof(dd88));
+	ret = it930x_write_xfer_size(dev, dev->urb_buf_size);
 	if (ret)
 		return ret;
 	ret = it930x_write_reg(dev, 0xdd0c, 0x80);
@@ -1159,7 +1209,8 @@ static void it930x_stop_streaming(struct it930x_dev *dev);
 /*
  * Zero-copy TS packet routing for multi-frontend devices.
  *
- * URB_BUF_SIZE = 188 * 816 guarantees packets never span URB boundaries.
+ * Transfers are a whole number of 188-byte packets (urb_buf_size), so
+ * packets never span URB boundaries.
  * The IT930x threshold register (0xdd88) ensures complete multiples of 188.
  *
  * For multi-frontend: each packet has a modified sync byte encoding the
@@ -1250,6 +1301,8 @@ static int it930x_start_streaming(struct it930x_dev *dev)
 
 	if (dev->streaming)
 		return 0;
+	if (dev->stream_dead)
+		return -ENODEV;
 
 	mutex_lock(&dev->io_lock);
 	ret = it930x_write_reg(dev, IT930X_REG_TS_SYNC_BYPASS, 0x00);
@@ -1275,20 +1328,49 @@ static int it930x_start_streaming(struct it930x_dev *dev)
 	 * and can be the previous channel's data after a retune. Backlog reads
 	 * complete almost instantly; once caught up, a full buffer of live
 	 * data takes far longer (~27ms at 19.4Mbit/s), so stop at the first
-	 * slow or short read.
+	 * slow or short read. Both limits scale with the transfer size so the
+	 * drain covers the same amount of backlog whatever urb_packets is.
 	 */
-	for (i = 0; i < 64; i++) {
-		ktime_t t = ktime_get();
+	{
+		int max_reads = 64 * (IT930X_URB_BUF_SIZE / dev->urb_buf_size);
+		s64 slow_us = max_t(s64, 500,
+				    5000LL * dev->urb_buf_size / IT930X_URB_BUF_SIZE);
 
-		if (usb_bulk_msg(dev->udev,
-				 usb_rcvbulkpipe(dev->udev, IT930X_EP_TS),
-				 dev->urb_bufs[0], IT930X_URB_BUF_SIZE,
-				 &flush_len, 100) ||
-		    flush_len < IT930X_URB_BUF_SIZE ||
-		    ktime_ms_delta(ktime_get(), t) > 5)
-			break;
+		for (i = 0; i < max_reads; i++) {
+			ktime_t t = ktime_get();
+
+			if (usb_bulk_msg(dev->udev,
+					 usb_rcvbulkpipe(dev->udev, IT930X_EP_TS),
+					 dev->urb_bufs[0], dev->urb_buf_size,
+					 &flush_len, 100) ||
+			    flush_len < dev->urb_buf_size ||
+			    ktime_us_delta(ktime_get(), t) > slow_us)
+				break;
+		}
 	}
 	dev_dbg(&dev->intf->dev, "flushed %d stale buffers\n", i);
+
+	/*
+	 * Switch the transfer size only now, with the backlog read at the old
+	 * size. Data the bridge already holds can make the first transfer at
+	 * a new, smaller size overflow its URB; that one is dropped and the
+	 * TS resync in the demod's ALP path recovers.
+	 */
+	{
+		u32 want = 188 * it930x_xfer_packets(dev);
+
+		if (want != dev->urb_buf_size) {
+			mutex_lock(&dev->io_lock);
+			ret = it930x_write_xfer_size(dev, want);
+			mutex_unlock(&dev->io_lock);
+			if (ret) {
+				dev_err(&dev->intf->dev,
+					"transfer size config failed (%d)\n", ret);
+				return ret;
+			}
+			dev->urb_buf_size = want;
+		}
+	}
 
 	/* Reset stats */
 	dev->urb_complete_ok = 0;
@@ -1299,7 +1381,7 @@ static int it930x_start_streaming(struct it930x_dev *dev)
 	for (i = 0; i < IT930X_URB_COUNT; i++) {
 		usb_fill_bulk_urb(dev->urbs[i], dev->udev,
 				  usb_rcvbulkpipe(dev->udev, IT930X_EP_TS),
-				  dev->urb_bufs[i], IT930X_URB_BUF_SIZE,
+				  dev->urb_bufs[i], dev->urb_buf_size,
 				  it930x_urb_complete, dev);
 		dev->urbs[i]->transfer_dma = dev->urb_dma[i];
 		dev->urbs[i]->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
@@ -1319,8 +1401,8 @@ static int it930x_start_streaming(struct it930x_dev *dev)
 		}
 	}
 
-	dev_info(&dev->intf->dev, "TS streaming started (%d URBs)\n",
-		 IT930X_URB_COUNT);
+	dev_info(&dev->intf->dev, "TS streaming started (%d URBs x %u TS packets)\n",
+		 IT930X_URB_COUNT, dev->urb_buf_size / 188);
 
 	return 0;
 }
@@ -2422,10 +2504,51 @@ static int it930x_alp_l1(void *priv, u32 what, u8 *buf, u32 len)
 	return cxd2878_atsc3_get_l1(ife->fe->demodulator_priv, what, buf, len);
 }
 
+/*
+ * /dev/alpraw%d transfer-size request. The size is per bridge. When idle it
+ * is applied by the next stream start. A running stream takes a smaller size
+ * at once - only the threshold changes; the queued URBs are larger and
+ * complete on each shorter transfer - while a larger one waits for the next
+ * start (a too-small size only costs USB completions).
+ */
+static int it930x_alp_set_xfer(void *priv, u32 packets)
+{
+	struct it930x_fe_ctx *ife = priv;
+	struct it930x_dev *dev = ife->dev;
+	int ret = 0;
+
+	mutex_lock(&dev->stream_lock);
+	if (packets != U32_MAX) {
+		u32 want;
+
+		ife->xfer_req = packets ? clamp_t(u32, packets, IT930X_URB_MIN_PACKETS,
+						  IT930X_URB_BUF_SIZE / 188) : 0;
+		want = 188 * it930x_xfer_packets(dev);
+		if (dev->streaming && !dev->stream_dead &&
+		    want < dev->urb_buf_size) {
+			mutex_lock(&dev->io_lock);
+			ret = it930x_write_xfer_size(dev, want);
+			mutex_unlock(&dev->io_lock);
+			if (!ret) {
+				dev->urb_buf_size = want;
+				dev_info(&dev->intf->dev,
+					 "USB transfer size now %u TS packets\n",
+					 want / 188);
+			}
+		}
+	}
+	if (!ret)
+		ret = dev->streaming ? dev->urb_buf_size / 188
+				     : it930x_xfer_packets(dev);
+	mutex_unlock(&dev->stream_lock);
+	return ret;
+}
+
 static const struct alp_ops it930x_alp_ops = {
-	.open = it930x_alp_open,
-	.stop = it930x_alp_stop,
-	.l1   = it930x_alp_l1,
+	.open     = it930x_alp_open,
+	.stop     = it930x_alp_stop,
+	.l1       = it930x_alp_l1,
+	.set_xfer = it930x_alp_set_xfer,
 };
 
 /* -------- DVB registration -------- */
@@ -2593,7 +2716,10 @@ static void it930x_dvb_exit(struct it930x_dev *dev)
 {
 	int i;
 
+	mutex_lock(&dev->stream_lock);
+	dev->stream_dead = true;
 	it930x_stop_streaming(dev);
+	mutex_unlock(&dev->stream_lock);
 	it930x_free_urbs(dev);
 
 	for (i = dev->board->num_frontends - 1; i >= 0; i--) {
@@ -2654,6 +2780,14 @@ static int it930x_probe(struct usb_interface *intf,
 	dev->udev = usb_get_dev(interface_to_usbdev(intf));
 	dev->intf = intf;
 	dev->board = board;
+
+	/* the size post_boot programs; streams then use it930x_xfer_packets() */
+	dev->urb_buf_size = 188 * clamp_t(unsigned int, urb_packets,
+					  IT930X_URB_MIN_PACKETS,
+					  IT930X_URB_BUF_SIZE / 188);
+	if (dev->urb_buf_size != 188 * urb_packets)
+		dev_warn(&intf->dev, "urb_packets=%u out of range, using %u\n",
+			 urb_packets, dev->urb_buf_size / 188);
 	mutex_init(&dev->cmd_mutex);
 	mutex_init(&dev->io_lock);
 	mutex_init(&dev->stream_lock);

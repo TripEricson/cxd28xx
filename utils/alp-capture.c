@@ -11,7 +11,7 @@
  *
  * Usage: alp-capture -w <file.pcap|-> [-c channel | -F freq_hz] [-p plps]
  *                    [-a adapter] [-n frontend] [-i /dev/alpraw0] [-N count]
- *                    [-t seconds] [-q] [-l l1.txt | -L]
+ *                    [-t seconds] [-q] [-l l1.txt | -L] [-x packets]
  *
  *   With -c or -F, tunes ATSC 3.0 itself (like atsc3-zap), waits for lock and
  *   holds the frontend for the whole capture. Without them, tune separately
@@ -20,6 +20,12 @@
  *
  *   At start, the HDHomeRun-style L1 string - base64(L1-Basic 25 bytes +
  *   L1-Detail) - is written next to the pcap (capture.pcap -> capture.txt).
+ *
+ *   The tuner's USB bridge passes data on only in whole transfers, 64 KB by
+ *   default, so a PLP of a few kbit/s decoded on its own could take minutes
+ *   to arrive. From the decoded PLPs' capacity in L1-Detail, alp-capture asks
+ *   for transfers that fill in about half a second when 64 KB would be
+ *   slower; -x sets the size by hand. The request ends with the capture.
  *
  * Build: make utils   (passes -DSYS_ATSC3=35 when the system headers lack it)
  */
@@ -74,7 +80,10 @@ static void usage(const char *p)
 		"  -q        no periodic status or signal lines on stderr\n"
 		"  -l FILE   write the HDHR-style L1 string to FILE\n"
 		"            (default: the pcap name with .txt; required with -w -)\n"
-		"  -L        don't write the L1 string\n", p);
+		"  -L        don't write the L1 string\n"
+		"  -x N      USB transfer size in TS packets (4-348, 0 = driver default);\n"
+		"            default: sized from the selected PLPs' bitrate, so a\n"
+		"            low-bitrate PLP on its own still arrives promptly\n", p);
 }
 
 static int write_all(FILE *f, const void *p, size_t n)
@@ -450,6 +459,213 @@ static void settle_and_report(int fe, int raw, int quiet)
 	fprintf(stderr, "\n");
 }
 
+/* ── Transfer size from the selected PLPs' bitrate ─────────────────────── */
+
+struct bitr {
+	const uint8_t *d;
+	unsigned len, pos;	/* bytes, bits */
+	int err;
+};
+
+static unsigned get_bits(struct bitr *r, int n)
+{
+	unsigned v = 0;
+
+	while (n--) {
+		if (r->pos >= r->len * 8) {
+			r->err = 1;
+			return 0;
+		}
+		v = (v << 1) | ((r->d[r->pos >> 3] >> (7 - (r->pos & 7))) & 1);
+		r->pos++;
+	}
+	return v;
+}
+
+/*
+ * Capacity, in bits per second, of the PLPs whose IDs are set in want[]
+ * (A/322 L1-Detail; layout as in atsc3-l1.py): cells per frame x bits per
+ * cell x code rate, over the frame duration. FEC overhead beyond the code
+ * rate is ignored - this only has to be right to within a factor of two.
+ * Returns 0 if L1 can't be parsed.
+ */
+static double plp_bitrate(const uint8_t *r93, const uint8_t *l1d, unsigned dlen,
+			  const int *want)
+{
+	static const unsigned gi_samples[13] = { 0, 192, 384, 512, 768, 1024, 1536,
+						 2048, 2432, 3072, 3648, 4096, 4864 };
+	struct bitr r = { l1d, dlen, 0, 0 };
+	unsigned num_rf, tif, nsf, i, j, k;
+	double bits = 0, samples = 0, frame_s;
+	unsigned sf0_fft = r93[0x6F] >> 6;
+	unsigned sf0_gi = ((r93[0x6F] & 7) << 1) | (r93[0x70] >> 7);
+
+	get_bits(&r, 4);				/* version */
+	num_rf = get_bits(&r, 3);
+	for (i = 0; i < num_rf; i++)
+		get_bits(&r, 19);			/* bonded bsid, reserved */
+	tif = (r93[0x60] >> 1) & 3;
+	if (tif)
+		get_bits(&r, 42 + 10 * (tif - 1));	/* sec, msec [, usec [, nsec]] */
+	nsf = r93[0x68] + 1;
+
+	/* bootstrap (4 symbols, 2 ms) and preamble, approximated with
+	 * subframe 0's FFT size and guard interval */
+	samples = 0.002 * 6.912e6 +
+		  ((r93[0x69] >> 5) + 1) * ((8192u << sf0_fft) + gi_samples[sf0_gi % 13]);
+
+	for (i = 0; i < nsf && !r.err; i++) {
+		unsigned mimo, fft, gi, nsym, sbs_first, sbs_last, nplp;
+
+		if (i == 0) {
+			mimo = (r93[0x6E] >> 2) & 1;
+			fft = sf0_fft;
+			gi = sf0_gi;
+			nsym = ((r93[0x70] & 0x7F) << 4) | (r93[0x71] >> 4);
+			sbs_first = (r93[0x72] >> 1) & 1;
+			sbs_last = r93[0x72] & 1;
+		} else {
+			mimo = get_bits(&r, 1);
+			get_bits(&r, 2);		/* miso */
+			fft = get_bits(&r, 2);
+			get_bits(&r, 3);		/* reduced carriers */
+			gi = get_bits(&r, 4);
+			nsym = get_bits(&r, 11);
+			get_bits(&r, 5 + 3);		/* sp, sp boost */
+			sbs_first = get_bits(&r, 1);
+			sbs_last = get_bits(&r, 1);
+		}
+		if (fft > 2)
+			return 0;
+		samples += (nsym + 1.0) * ((8192u << fft) + gi_samples[gi % 13]);
+		if (nsf > 1)
+			get_bits(&r, 1);		/* subframe mux */
+		get_bits(&r, 1);			/* frequency interleaver */
+		if (sbs_first || sbs_last)
+			get_bits(&r, 13);
+		nplp = get_bits(&r, 6) + 1;
+		for (j = 0; j < nplp && !r.err; j++) {
+			unsigned id = get_bits(&r, 6), layer, size, fec, mod = 0, cod = 0, ti;
+
+			get_bits(&r, 1);		/* lls */
+			layer = get_bits(&r, 2);
+			get_bits(&r, 24);		/* start */
+			size = get_bits(&r, 24);
+			get_bits(&r, 2);		/* scrambler */
+			fec = get_bits(&r, 4);
+			if (fec <= 5) {
+				mod = get_bits(&r, 4);
+				cod = get_bits(&r, 4);
+			}
+			ti = get_bits(&r, 2);
+			if (ti == 0)
+				get_bits(&r, 15);
+			else if (ti == 1)
+				get_bits(&r, 22);
+			if (num_rf > 0) {
+				unsigned nb = get_bits(&r, 3);
+
+				if (nb) {
+					get_bits(&r, 2);
+					get_bits(&r, 3 * (nb + 1));
+				}
+			}
+			if (mimo)
+				get_bits(&r, 3);
+			if (layer == 0) {
+				if (get_bits(&r, 1))	/* plp_type: subslices */
+					get_bits(&r, 14 + 24);
+				if ((ti == 1 || ti == 2) && mod == 0)
+					get_bits(&r, 1);
+				if (ti == 1) {
+					get_bits(&r, 3 + 11);
+				} else if (ti == 2) {
+					unsigned inter = get_bits(&r, 1);
+					unsigned nti = get_bits(&r, 4) + 1;
+
+					get_bits(&r, 12);
+					for (k = 0; k < (inter ? nti : 1); k++)
+						get_bits(&r, 12);
+					get_bits(&r, 1);
+				}
+			} else {
+				get_bits(&r, 5);	/* LDM injection level */
+			}
+			if (want[id] && mod <= 5 && cod <= 11)
+				bits += (double)size * (2 * mod + 2) * (cod + 2) / 15.0;
+		}
+	}
+	if (r.err || samples <= 0)
+		return 0;
+	if (!(r93[0x61] & 1))				/* time-aligned: 5 ms units */
+		frame_s = ((r93[0x62] << 2) | (r93[0x63] >> 6)) * 0.005;
+	else
+		frame_s = samples / 6.912e6;
+	return frame_s > 0 ? bits / frame_s : 0;
+}
+
+#define XFER_MAX_PACKETS 348	/* the bridge's default, 64 KB */
+#define XFER_FILL_SEC	0.5	/* aim for a transfer at least this often */
+
+/*
+ * The tuner's USB bridge hands data over only in whole transfers (64 KB by
+ * default). A PLP of a few kbit/s decoded on its own would then take minutes
+ * to arrive, so ask for transfers that fill in about XFER_FILL_SEC at the
+ * selected PLPs' rate. Must run before the first read()/poll() starts the
+ * stream. manual: -x value (-1 = automatic, 0 = driver default).
+ */
+static void set_transfer_size(int raw, int manual, int quiet)
+{
+	static uint8_t l1d[8192];
+	uint8_t r93[256], have[256];
+	int want[64] = { 0 }, i, n, any = 0;
+	double bps = 0;
+	uint32_t packets, eff;
+
+	if (manual >= 0) {
+		packets = manual;
+	} else {
+		if (read_bank93(raw, r93, have) || !have[0x83] || !have[0x72] ||
+		    (r93[0x10] & 3) != 3)
+			return;
+		for (i = 0; i < 4; i++)
+			if (r93[0x80 + i] & 0x80) {
+				want[r93[0x80 + i] & 0x3F] = 1;
+				any = 1;
+			}
+		n = l1_get(raw, ALP_RAW_L1_DETAIL, l1d, sizeof(l1d));
+		if (!any || n <= 0)
+			return;
+		bps = plp_bitrate(r93, l1d, n, want);
+		if (bps <= 0)
+			return;
+		packets = (uint32_t)(bps / 8 * XFER_FILL_SEC / 188) + 1;
+		if (packets >= XFER_MAX_PACKETS)
+			return;		/* fast enough for the default */
+	}
+
+	eff = packets;
+	if (ioctl(raw, ALP_RAW_IOC_SET_XFER, &eff) < 0) {
+		if (errno == ENOTTY || errno == EOPNOTSUPP)
+			fprintf(stderr, "warning: driver can't change the USB transfer size%s;\n"
+				"  low-bitrate PLPs may take minutes to arrive\n",
+				errno == ENOTTY ? " (old alp.ko?)" : "");
+		else
+			fprintf(stderr, "warning: setting the USB transfer size: %s\n",
+				strerror(errno));
+		return;
+	}
+	if (quiet)
+		return;
+	if (manual >= 0)
+		fprintf(stderr, "USB transfers: %u TS packets%s\n", eff,
+			manual ? "" : " (driver default)");
+	else
+		fprintf(stderr, "low-bitrate PLPs (~%.0f kbit/s capacity): USB transfers"
+			" of %u TS packets (one every ~%.1f s)\n",
+			bps / 1000, eff, eff * 188 * 8 / bps);
+}
+
 static const char *raw_err(int err)
 {
 	switch (err) {
@@ -465,14 +681,14 @@ int main(int argc, char **argv)
 	char l1buf[512], devbuf[64];
 	int no_l1 = 0, rc = 1, quiet = 0, opt, raw = -1;
 	unsigned freq = 0, stream_id = NO_STREAM_ID_FILTER;
-	int adapter = 0, frontend = 0, lock_timeout = 10, fe = -1, locked = 1;
+	int adapter = 0, frontend = 0, lock_timeout = 10, fe = -1, locked = 1, xfer = -1;
 	long channel = 0, tick = 0, max_count = 0, max_secs = 0;
 	unsigned long long pkts = 0, bytes = 0, types[8] = { 0 }, drops = 0;
 	struct timespec start, now, last_fe = { 0, 0 };
 	FILE *out = NULL;
 	static uint8_t buf[REC_BUF];
 
-	while ((opt = getopt(argc, argv, "w:i:c:N:t:ql:LF:p:a:n:T:h")) != -1) {
+	while ((opt = getopt(argc, argv, "w:i:c:N:t:ql:LF:p:a:n:T:x:h")) != -1) {
 		switch (opt) {
 		case 'w': outname = optarg; break;
 		case 'i': devname = optarg; break;
@@ -507,6 +723,7 @@ int main(int argc, char **argv)
 		case 'a': adapter = atoi(optarg); break;
 		case 'n': frontend = atoi(optarg); break;
 		case 'T': lock_timeout = atoi(optarg); break;
+		case 'x': xfer = atoi(optarg); break;
 		default: usage(argv[0]); return opt == 'h' ? 0 : 1;
 		}
 	}
@@ -595,6 +812,8 @@ int main(int argc, char **argv)
 
 	if (!no_l1)
 		write_l1_string(raw, l1name, quiet);
+	/* before the first poll() below starts the stream */
+	set_transfer_size(raw, xfer, quiet);
 
 	out = strcmp(outname, "-") ? fopen(outname, "wb") : stdout;
 	if (!out) {
