@@ -9,7 +9,7 @@
  * serves L1 signalling through an ioctl. With the udev rule (99-alpraw.rules)
  * it belongs to group "video", like /dev/dvb, so no root is needed.
  *
- * Usage: alp-capture -w <file.pcap|-> [-c channel | -F freq_hz] [-p plps]
+ * Usage: alp-capture [-w file.pcap|-] [-c channel | -F freq_hz] [-p plps]
  *                    [-a adapter] [-n frontend] [-i /dev/alpraw0] [-N count]
  *                    [-t seconds] [-q] [-l l1.txt | -L] [-x packets]
  *
@@ -20,6 +20,8 @@
  *
  *   At start, the HDHomeRun-style L1 string - base64(L1-Basic 25 bytes +
  *   L1-Detail) - is written next to the pcap (capture.pcap -> capture.txt).
+ *   Without -w, the name is rf<channel>-<yyyymmdd>-<hhmmss>-<plps>-alp.pcap
+ *   (local time, the PLPs being decoded), e.g. rf25-20261111-085734-p0p1-alp.
  *
  *   The tuner's USB bridge passes data on only in whole transfers, 64 KB by
  *   default, so a PLP of a few kbit/s decoded on its own could take minutes
@@ -65,8 +67,10 @@ static void on_signal(int sig)
 static void usage(const char *p)
 {
 	fprintf(stderr,
-		"Usage: %s -w <file.pcap|-> [-c channel | -F freq_hz] [-p plps] [options]\n"
-		"  -w FILE   output pcap (LINKTYPE_ATSC_ALP); '-' for stdout\n"
+		"Usage: %s [-w file.pcap|-] [-c channel | -F freq_hz] [-p plps] [options]\n"
+		"  -w FILE   output pcap (LINKTYPE_ATSC_ALP); '-' for stdout. Default:\n"
+		"            rf<channel>-<date>-<time>-<plps>-alp.pcap in the current\n"
+		"            directory, e.g. rf25-20261111-085734-p0p1-alp.pcap\n"
 		"  -c CH     tune US RF channel CH (2-36) first and hold the tuner\n"
 		"  -F HZ     tune ATSC 3.0 to HZ first (e.g. 569000000) and hold the tuner\n"
 		"  -p LIST   PLP IDs to decode, up to 4 (e.g. 0,1,16); default auto:\n"
@@ -107,6 +111,20 @@ static unsigned us_channel_hz(long ch)
 		return (177 + 6 * (ch - 7)) * 1000000u;
 	if (ch >= 14 && ch <= 36)
 		return (473 + 6 * (ch - 14)) * 1000000u;
+	return 0;
+}
+
+/* Inverse of us_channel_hz(): the channel whose centre is within 1 MHz. */
+static long us_hz_channel(unsigned hz)
+{
+	long ch;
+
+	for (ch = 2; ch <= 36; ch++) {
+		unsigned c = us_channel_hz(ch);
+
+		if (c && (hz > c ? hz - c : c - hz) < 1000000)
+			return ch;
+	}
 	return 0;
 }
 
@@ -433,6 +451,57 @@ static void write_l1_string(int fd, const char *path, int quiet)
  * runs from read_status once L1-Detail is decoded) until L1 is decoded,
  * then report which PLPs the demod is decoding.
  */
+/* PLP IDs the demod is decoding now (slots 93h:80h-83h); count, or -1. */
+static int decoded_plps(int raw, int ids[4])
+{
+	uint8_t r93[256], have[256];
+	int i, n = 0;
+
+	if (read_bank93(raw, r93, have) || !have[0x83])
+		return -1;
+	for (i = 0; i < 4; i++)
+		if (r93[0x80 + i] & 0x80)
+			ids[n++] = r93[0x80 + i] & 0x3F;
+	return n;
+}
+
+/*
+ * Default output name: rf<channel>-<yyyymmdd>-<hhmmss>-p<id>p<id>-alp.pcap,
+ * local time, with the PLPs actually being decoded. Off the US channel plan
+ * the frequency stands in (f539.25MHz); unknown entirely, "rfx".
+ */
+static void default_pcap_name(char *out, size_t len, unsigned freq, int raw,
+			      unsigned stream_id)
+{
+	char rf[32], plps[32] = "", when[32];
+	int ids[4], n, i;
+	size_t o = 0;
+	time_t t = time(NULL);
+	long ch = freq ? us_hz_channel(freq) : 0;
+
+	if (ch)
+		snprintf(rf, sizeof(rf), "rf%ld", ch);
+	else if (freq)
+		snprintf(rf, sizeof(rf), "f%gMHz", freq / 1e6);
+	else
+		snprintf(rf, sizeof(rf), "rfx");
+
+	n = decoded_plps(raw, ids);
+	if (n <= 0 && stream_id != NO_STREAM_ID_FILTER) {
+		/* fall back to what was asked for */
+		for (n = 0, i = 0; i < 4; i++)
+			if (((stream_id >> (8 * i)) & 0xFF) != 0xFF)
+				ids[n++] = (stream_id >> (8 * i)) & 0xFF;
+	}
+	for (i = 0; i < n && o < sizeof(plps); i++)
+		o += snprintf(plps + o, sizeof(plps) - o, "p%d", ids[i]);
+	if (n <= 0)
+		snprintf(plps, sizeof(plps), "pauto");
+
+	strftime(when, sizeof(when), "%Y%m%d-%H%M%S", localtime(&t));
+	snprintf(out, len, "%s-%s-%s-alp.pcap", rf, when, plps);
+}
+
 static void settle_and_report(int fe, int raw, int quiet)
 {
 	uint8_t r93[256], have[256];
@@ -713,6 +782,7 @@ static const char *raw_err(int err)
 int main(int argc, char **argv)
 {
 	const char *devname = NULL, *outname = NULL, *l1name = NULL;
+	static char namebuf[128];
 	char l1buf[512], devbuf[64];
 	int no_l1 = 0, rc = 1, quiet = 0, opt, raw = -1;
 	unsigned freq = 0, stream_id = NO_STREAM_ID_FILTER;
@@ -762,21 +832,9 @@ int main(int argc, char **argv)
 		default: usage(argv[0]); return opt == 'h' ? 0 : 1;
 		}
 	}
-	if (!outname) {
-		usage(argv[0]);
-		return 1;
-	}
 	if (stream_id != NO_STREAM_ID_FILTER && !freq) {
 		fprintf(stderr, "-p needs -c or -F (PLPs are chosen when tuning)\n");
 		return 1;
-	}
-	if (!no_l1 && !l1name) {
-		if (!strcmp(outname, "-")) {
-			no_l1 = 1;
-		} else {
-			default_l1_name(outname, l1buf, sizeof(l1buf));
-			l1name = l1buf;
-		}
 	}
 	if (!devname) {
 		snprintf(devbuf, sizeof(devbuf), "/dev/alpraw%d", adapter);
@@ -845,6 +903,25 @@ int main(int argc, char **argv)
 				fe_path, strerror(errno));
 	}
 
+	if (!outname) {
+		struct dtv_property pf = { .cmd = DTV_FREQUENCY };
+		struct dtv_properties pp = { .num = 1, .props = &pf };
+		unsigned hz = freq;
+
+		/* tuned by someone else: ask the frontend where */
+		if (!hz && fe >= 0 && !ioctl(fe, FE_GET_PROPERTY, &pp))
+			hz = pf.u.data;
+		default_pcap_name(namebuf, sizeof(namebuf), hz, raw, stream_id);
+		outname = namebuf;
+	}
+	if (!no_l1 && !l1name) {
+		if (!strcmp(outname, "-")) {
+			no_l1 = 1;
+		} else {
+			default_l1_name(outname, l1buf, sizeof(l1buf));
+			l1name = l1buf;
+		}
+	}
 	if (!no_l1)
 		write_l1_string(raw, l1name, quiet);
 	/* before the first poll() below starts the stream */
