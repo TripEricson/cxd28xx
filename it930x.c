@@ -1263,6 +1263,11 @@ static void it930x_urb_complete(struct urb *urb)
 	switch (urb->status) {
 	case 0:
 		if (urb->actual_length > 0) {
+			if (dev->urb_complete_ok < 3)
+				dev_info(&dev->intf->dev,
+					 "transfer %lu: %d bytes (threshold %u)\n",
+					 dev->urb_complete_ok, urb->actual_length,
+					 dev->urb_buf_size);
 			it930x_ts_route(dev, urb->transfer_buffer,
 					urb->actual_length);
 			dev->urb_complete_ok++;
@@ -1275,15 +1280,13 @@ static void it930x_urb_complete(struct urb *urb)
 	case -ENOENT:
 	case -ESHUTDOWN:
 		return;
-	case -EOVERFLOW:
-		dev->urb_complete_err++;
-		dev_dbg(&dev->intf->dev,
-			"URB overflow (actual=%d buf=%d)\n",
-			urb->actual_length, urb->transfer_buffer_length);
-		break;
 	default:
 		dev->urb_complete_err++;
-		dev_dbg(&dev->intf->dev, "URB error %d\n", urb->status);
+		dev_info_ratelimited(&dev->intf->dev,
+				     "URB error %d (actual=%d buf=%d, threshold %u packets)\n",
+				     urb->status, urb->actual_length,
+				     urb->transfer_buffer_length,
+				     dev->urb_buf_size / 188);
 		break;
 	}
 
@@ -1341,7 +1344,7 @@ static int it930x_start_streaming(struct it930x_dev *dev)
 
 			if (usb_bulk_msg(dev->udev,
 					 usb_rcvbulkpipe(dev->udev, IT930X_EP_TS),
-					 dev->urb_bufs[0], dev->urb_buf_size,
+					 dev->urb_bufs[0], IT930X_URB_BUF_SIZE,
 					 &flush_len, 100) ||
 			    flush_len < dev->urb_buf_size ||
 			    ktime_us_delta(ktime_get(), t) > slow_us)
@@ -1378,10 +1381,16 @@ static int it930x_start_streaming(struct it930x_dev *dev)
 	dev->urb_complete_empty = 0;
 	dev->urb_bytes_total = 0;
 
+	/*
+	 * URBs always take the largest transfer: the bridge does not stop at
+	 * exactly the 0xdd88 threshold (with small thresholds it sends more),
+	 * and a URB sized to the threshold would overflow. Each transfer ends
+	 * in a short packet, so a larger URB still completes on it.
+	 */
 	for (i = 0; i < IT930X_URB_COUNT; i++) {
 		usb_fill_bulk_urb(dev->urbs[i], dev->udev,
 				  usb_rcvbulkpipe(dev->udev, IT930X_EP_TS),
-				  dev->urb_bufs[i], dev->urb_buf_size,
+				  dev->urb_bufs[i], IT930X_URB_BUF_SIZE,
 				  it930x_urb_complete, dev);
 		dev->urbs[i]->transfer_dma = dev->urb_dma[i];
 		dev->urbs[i]->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;

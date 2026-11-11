@@ -625,23 +625,58 @@ static void set_transfer_size(int raw, int manual, int quiet)
 	if (manual >= 0) {
 		packets = manual;
 	} else {
-		if (read_bank93(raw, r93, have) || !have[0x83] || !have[0x72] ||
-		    (r93[0x10] & 3) != 3)
-			return;
-		for (i = 0; i < 4; i++)
-			if (r93[0x80 + i] & 0x80) {
-				want[r93[0x80 + i] & 0x3F] = 1;
-				any = 1;
+		const char *why = NULL;
+		int tries;
+
+		/* L1 can lag the PLP selection; retry briefly */
+		for (tries = 0; tries < 10 && running; tries++) {
+			if (tries)
+				usleep(300000);
+			n = read_bank93(raw, r93, have);
+			if (n) {
+				why = l1_why(n);
+				continue;
 			}
-		n = l1_get(raw, ALP_RAW_L1_DETAIL, l1d, sizeof(l1d));
-		if (!any || n <= 0)
+			if (!have[0x83] || !have[0x72]) {
+				why = "register snapshot incomplete";
+				continue;
+			}
+			if ((r93[0x10] & 3) != 3) {
+				why = "L1 not decoded yet";
+				continue;
+			}
+			memset(want, 0, sizeof(want));
+			any = 0;
+			for (i = 0; i < 4; i++)
+				if (r93[0x80 + i] & 0x80) {
+					want[r93[0x80 + i] & 0x3F] = 1;
+					any = 1;
+				}
+			if (!any) {
+				why = "no PLPs selected yet";
+				continue;
+			}
+			n = l1_get(raw, ALP_RAW_L1_DETAIL, l1d, sizeof(l1d));
+			if (n <= 0) {
+				why = n ? l1_why(n) : "empty L1-Detail";
+				continue;
+			}
+			bps = plp_bitrate(r93, l1d, n, want);
+			why = bps > 0 ? NULL : "can't parse L1-Detail";
+			break;
+		}
+		if (why) {
+			fprintf(stderr, "note: USB transfer size left at default (%s);"
+				" use -x for a low-bitrate PLP\n", why);
 			return;
-		bps = plp_bitrate(r93, l1d, n, want);
-		if (bps <= 0)
-			return;
+		}
 		packets = (uint32_t)(bps / 8 * XFER_FILL_SEC / 188) + 1;
-		if (packets >= XFER_MAX_PACKETS)
-			return;		/* fast enough for the default */
+		if (packets >= XFER_MAX_PACKETS) {
+			if (!quiet)
+				fprintf(stderr, "PLP capacity ~%.1f Mbit/s: default USB transfers\n",
+					bps / 1e6);
+			return;
+		}
 	}
 
 	eff = packets;
