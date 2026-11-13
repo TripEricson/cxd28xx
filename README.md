@@ -9,11 +9,13 @@ This fork of [majortom9/cxd28xx](https://github.com/majortom9/cxd28xx) (itself b
 - **`utils/alp-pcap-check.py`** and **`utils/atsc3-l1.py`**: check captures and decode L1 signalling.
 
 ### Setup
+~~~bash
 make && make utils
 sudo cp 99-alpraw.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger
-sudo usermod -aG video $USER # then log out and back in
-./utils/alp-capture -c 25 -t 30 # 30-second capture of RF 25
+sudo usermod -aG video $USER        # then log out and back in
+./utils/alp-capture -c 25 -t 30     # 30-second capture of RF 25
+~~~
 
 Testing was done with insmod, and DKMS has not yet been tested.
 
