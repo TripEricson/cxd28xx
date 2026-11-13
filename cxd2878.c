@@ -98,7 +98,7 @@ static struct sony_freia_terr_adjust_param_t g_terr_param_table_freia[SONY_FREIA
     {AUTO, 0x03, 0x0B, 0x0B, 0x0B, 0x03, 0x03, 0x03, 0x00, BW_8,  OFFSET(-2), OFFSET(-3), AUTO,   AUTO}, /**< SONY_FREIA_DTV_CABLE_8   (DVB-C 8MHzBW,7MHzBW) */
     {AUTO, 0x04, 0x09, 0x09, 0x09, 0x02, 0x02, 0x02, 0x00, BW_6,  OFFSET(-6), OFFSET(-2), AUTO,   AUTO}, /**< SONY_FREIA_DTV_DVBC2_6   (DVB-C2 6MHzBW) */
     {AUTO, 0x04, 0x09, 0x09, 0x09, 0x02, 0x02, 0x02, 0x00, BW_8,  OFFSET(-2), OFFSET(0),  AUTO,   AUTO}, /**< SONY_FREIA_DTV_DVBC2_8   (DVB-C2 8MHzBW) */
-    {AUTO, 0x06, 0x0B, 0x0B, 0x0B, 0x03, 0x03, 0x03, 0x00, BW_6,  OFFSET(-8), OFFSET(-3), AUTO,   AUTO}, /**< SONY_FREIA_DTV_ATSC3_6   (ATSC 3.0 6MHzBW) */
+    {AUTO, 0x06, 0x0E, 0x0E, 0x0E, 0x03, 0x03, 0x03, 0x00, BW_6,  OFFSET(-8), OFFSET(-3), AUTO,   AUTO}, /**< SONY_FREIA_DTV_ATSC3_6   (ATSC 3.0 6MHzBW) */
     {AUTO, 0x06, 0x0B, 0x0B, 0x0B, 0x03, 0x03, 0x03, 0x00, BW_7,  OFFSET(-6), OFFSET(-5), AUTO,   AUTO}, /**< SONY_FREIA_DTV_ATSC3_7   (ATSC 3.0 7MHzBW) */
     {AUTO, 0x06, 0x0B, 0x0B, 0x0B, 0x03, 0x03, 0x03, 0x00, BW_8,  OFFSET(-4), OFFSET(-6), AUTO,   AUTO}, /**< SONY_FREIA_DTV_ATSC3_8   (ATSC 3.0 8MHzBW) */
     {AUTO, 0x03, 0x0B, 0x0B, 0x0B, 0x03, 0x03, 0x03, 0x00, BW_6,  OFFSET(-5), OFFSET(2),  AUTO,   AUTO}, /**< SONY_FREIA_DTV_SKP_OPT   (J.83B 5.6Msps) */
@@ -5873,6 +5873,197 @@ static int cxd2878_sleep_fe(struct dvb_frontend *fe)
 	return 0;
 }
 
+/* ── ATSC 3.0 signalling readout ────────────────────────────────────
+ *
+ * cxd2878_atsc3_get_l1() fills a caller's buffer with one of:
+ *
+ *   CXD2878_L1_SNAPSHOT  raw register snapshot (bootstrap, OFDM, L1-Basic,
+ *                        PLP list, selected-PLP ModCod) from one consistent
+ *                        read. Format, after a 5-byte "CXA3"+version header:
+ *                        repeated records of bank, addr, len, status(0=ok),
+ *                        data[len].
+ *   CXD2878_L1_DETAIL    raw A/322 L1-Detail bytes (bit 0 = L1D_version,
+ *                        last 4 bytes = L1D_crc field).
+ *
+ * Bridges expose it to userspace through alp.ko's /dev/alpraw%d ioctl.
+ * Register map: cxd2878_atsc3_regs.h. Read-only apart from the demod's
+ * freeze (01h) and L1-Detail request/page registers (93h:E0h, 93h:E3h),
+ * which are released before returning. Process context only (sleeps).
+ */
+#define CXD_L1_I2C_CHUNK	40	/* IT930x short-read path */
+#define CXD_L1_SNAP_VERSION	1
+
+struct cxd2878_l1_rd {
+	u8 bank, addr, len;
+};
+
+struct cxd2878_l1_grp {
+	bool freeze;
+	u8 n;
+	struct cxd2878_l1_rd rd[4];
+};
+
+static const struct cxd2878_l1_grp cxd2878_l1_snapshot[] = {
+	/* lock state */
+	{ false, 2, { { 0x90, 0x10, 1 }, { 0x95, 0x40, 1 } } },
+	/* bootstrap: valid flag + 3 bytes */
+	{ true,  2, { { 0x90, 0xE6, 1 }, { 0x90, 0xE0, 3 } } },
+	/* bootstrap/preamble/subframe-0 OFDM parameters */
+	{ true,  1, { { 0x90, 0x57, 9 } } },
+	/* L1 status, L1-Basic, selected PLP slots + error, slot ModCod */
+	{ true,  4, { { 0x93, 0x10, 1 }, { 0x93, 0x60, 29 },
+		      { 0x93, 0x80, 6 }, { 0x93, 0x90, 6 } } },
+	/* PLP list (vendor code reads this without freeze) */
+	{ false, 1, { { 0x93, 0x9D, 36 } } },
+	/* SNR raw, for reference */
+	{ true,  2, { { 0x90, 0x28, 3 }, { 0x90, 0x58, 1 } } },
+};
+
+static int cxd2878_l1_read(struct cxd2878_dev *dev, u8 bank, u8 addr,
+			   u8 *buf, unsigned int len)
+{
+	int ret = cxd2878_wr(dev, dev->slvt, 0x00, bank);
+
+	while (!ret && len) {
+		unsigned int n = min_t(unsigned int, len, CXD_L1_I2C_CHUNK);
+
+		ret = cxd2878_rdm(dev, dev->slvt, addr, buf, n);
+		addr += n;
+		buf += n;
+		len -= n;
+	}
+	return ret;
+}
+
+/* Caller holds i2c_lock. */
+static int cxd2878_l1_snapshot_locked(struct cxd2878_dev *dev, u8 *out, u32 size)
+{
+	u32 need = 5, pos = 5;
+	int i, j;
+
+	for (i = 0; i < ARRAY_SIZE(cxd2878_l1_snapshot); i++)
+		for (j = 0; j < cxd2878_l1_snapshot[i].n; j++)
+			need += 4 + cxd2878_l1_snapshot[i].rd[j].len;
+	if (size < need)
+		return -ENOSPC;
+
+	memcpy(out, "CXA3", 4);
+	out[4] = CXD_L1_SNAP_VERSION;
+	for (i = 0; i < ARRAY_SIZE(cxd2878_l1_snapshot); i++) {
+		const struct cxd2878_l1_grp *g = &cxd2878_l1_snapshot[i];
+
+		if (g->freeze)
+			cxd2878_wr(dev, dev->slvt, 0x01, 0x01);
+		for (j = 0; j < g->n; j++) {
+			const struct cxd2878_l1_rd *rd = &g->rd[j];
+			u8 *rec = &out[pos];
+
+			rec[0] = rd->bank;
+			rec[1] = rd->addr;
+			rec[2] = rd->len;
+			rec[3] = cxd2878_l1_read(dev, rd->bank, rd->addr,
+						 &rec[4], rd->len) ? 1 : 0;
+			pos += 4 + rd->len;
+		}
+		if (g->freeze)
+			cxd2878_wr(dev, dev->slvt, 0x01, 0x00);
+	}
+	return pos;
+}
+
+/* Poll 93h:E1h (bank already 93h) every 10 ms for up to 100 ms. */
+static int cxd2878_l1d_wait(struct cxd2878_dev *dev, u8 ok, u8 err)
+{
+	int t, ret;
+	u8 st;
+
+	for (t = 0; t <= 100; t += 10) {
+		ret = cxd2878_rdm(dev, dev->slvt, 0xE1, &st, 1);
+		if (ret)
+			return ret;
+		if (st & err)
+			return -EIO;
+		if (st & ok)
+			return 0;
+		msleep(10);
+	}
+	return -ETIMEDOUT;
+}
+
+/* Caller holds i2c_lock. */
+static int cxd2878_l1_detail_locked(struct cxd2878_dev *dev, u8 *out, u32 bufsize)
+{
+	unsigned int size, off, page;
+	u8 b[2];
+	int ret;
+
+	ret = cxd2878_l1_read(dev, 0x93, 0x10, b, 1);
+	if (ret)
+		return ret;
+	if (!(b[0] & 0x02))		/* L1-Detail not valid yet */
+		return -EAGAIN;
+	ret = cxd2878_l1d_wait(dev, 0x80, 0x00);	/* ready for request */
+	if (ret)
+		return ret;
+
+	ret = cxd2878_wr(dev, dev->slvt, 0xE0, 0x01);	/* request + hold */
+	if (ret)
+		goto release;
+	ret = cxd2878_l1d_wait(dev, 0x20, 0x40);	/* data ready / error */
+	if (ret)
+		goto release;
+	ret = cxd2878_rdm(dev, dev->slvt, 0xE1, b, 2);
+	if (ret)
+		goto release;
+	size = ((b[0] & 0x1F) << 8) | b[1];
+	if (size < 4 || size > 8191) {
+		ret = -EIO;
+		goto release;
+	}
+	if (size > bufsize) {
+		ret = -ENOSPC;
+		goto release;
+	}
+	for (page = 0, off = 0; off < size; page++) {
+		unsigned int n = min_t(unsigned int, size - off, 240);
+
+		ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x93);
+		if (!ret)
+			ret = cxd2878_wr(dev, dev->slvt, 0xE3, page);
+		if (!ret)
+			ret = cxd2878_l1_read(dev, 0x92, 0x10, &out[off], n);
+		if (ret)
+			goto release;
+		off += n;
+	}
+	ret = size;
+release:
+	cxd2878_wr(dev, dev->slvt, 0x00, 0x93);
+	cxd2878_wr(dev, dev->slvt, 0xE0, 0x00);		/* release */
+	return ret;
+}
+
+int cxd2878_atsc3_get_l1(struct cxd2878_dev *dev, u32 what, u8 *buf, u32 len)
+{
+	int ret;
+
+	if (!dev || !buf)
+		return -EINVAL;
+	mutex_lock(&dev->base->i2c_lock);
+	if (dev->state != SONY_DEMOD_STATE_ACTIVE ||
+	    dev->system != SONY_DTV_SYSTEM_ATSC3)
+		ret = -ENODATA;		/* not tuned to ATSC 3.0 */
+	else if (what == CXD2878_L1_SNAPSHOT)
+		ret = cxd2878_l1_snapshot_locked(dev, buf, len);
+	else if (what == CXD2878_L1_DETAIL)
+		ret = cxd2878_l1_detail_locked(dev, buf, len);
+	else
+		ret = -EINVAL;
+	mutex_unlock(&dev->base->i2c_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(cxd2878_atsc3_get_l1);
+
 static void cxd2878_release (struct dvb_frontend*fe)
 {
 	struct cxd2878_dev *dev = fe->demodulator_priv;
@@ -6144,6 +6335,7 @@ EXPORT_SYMBOL_GPL(cxd2878_attach);
 static void alp_ctx_reset(struct cxd2878_dev *dev)
 {
 	dev->alp_buf_len = 0;
+	dev->ts_carry_len = 0;
 	dev->alp_active = false;
 }
 
@@ -6237,18 +6429,67 @@ static void cxd2878_alp_process_ts(struct cxd2878_dev *dev,
 	}
 }
 
+/*
+ * Is there a TS packet start at buf[pos]? Require the next sync byte too
+ * when it is in the buffer, so a stray 0x47 in payload isn't taken for one.
+ */
+static bool cxd2878_ts_sync_at(const u8 *buf, u32 len, u32 pos)
+{
+	if (buf[pos] != 0x47)
+		return false;
+	return pos + 188 >= len || buf[pos + 188] == 0x47;
+}
+
+/*
+ * Feed raw ALP-div-TS bytes from the bridge. Buffers are usually whole
+ * 188-byte packets starting on a sync byte, but if the stream starts or
+ * slips off a packet boundary (e.g. a partial packet left in the bridge
+ * when streaming begins), every later packet would fail the sync check.
+ * So, like dvb_dmx_swfilter(), resynchronise on 0x47 whenever sync is lost
+ * and carry a trailing partial packet over to the next call.
+ */
 void cxd2878_alp_feed_raw(struct cxd2878_dev *dev, struct alp_dev *alp,
 			  const u8 *buf, u32 len)
 {
-	u32 pos;
+	u32 pos = 0;
 
 	dev->alp_ts_stats.raw_bytes_in += len;
 
-	for (pos = 0; pos + 188 <= len; pos += 188) {
-		if (buf[pos] == 0x47)
-			cxd2878_alp_process_ts(dev, alp, buf + pos);
-		else
+	/* complete a packet left over from the previous buffer */
+	if (dev->ts_carry_len) {
+		u32 need = 188 - dev->ts_carry_len;
+
+		if (len < need) {
+			memcpy(dev->ts_carry + dev->ts_carry_len, buf, len);
+			dev->ts_carry_len += len;
+			return;
+		}
+		memcpy(dev->ts_carry + dev->ts_carry_len, buf, need);
+		dev->ts_carry_len = 0;
+		/* trust the carry only if the stream continues in sync after it */
+		if (need == len || buf[need] == 0x47) {
+			cxd2878_alp_process_ts(dev, alp, dev->ts_carry);
+			pos = need;
+		} else {
 			dev->alp_ts_stats.ts_sync_miss++;
+		}
+	}
+
+	while (pos < len) {
+		if (!cxd2878_ts_sync_at(buf, len, pos)) {
+			/* lost sync: count once, then find the next packet start */
+			dev->alp_ts_stats.ts_sync_miss++;
+			while (++pos < len && !cxd2878_ts_sync_at(buf, len, pos))
+				;
+			continue;
+		}
+		if (pos + 188 > len) {
+			dev->ts_carry_len = len - pos;
+			memcpy(dev->ts_carry, buf + pos, dev->ts_carry_len);
+			break;
+		}
+		cxd2878_alp_process_ts(dev, alp, buf + pos);
+		pos += 188;
 	}
 }
 EXPORT_SYMBOL_GPL(cxd2878_alp_feed_raw);

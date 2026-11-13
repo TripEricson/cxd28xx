@@ -13,6 +13,7 @@
 #include "cxd2878.h"
 #include "cxd2878_priv.h"
 #include "alp.h"
+#include "alp_raw.h"
 #include "m88rs6060.h"
 
 #define tbs5530_READ_MSG 0
@@ -390,6 +391,7 @@ static int tbs5530_alp_open(void *priv)
 		struct cxd2878_dev *cxd = dev->fe_ter->demodulator_priv;
 
 		cxd->alp_buf_len = 0;
+		cxd->ts_carry_len = 0;
 		cxd->alp_active = false;
 		memset(&cxd->alp_ts_stats, 0, sizeof(cxd->alp_ts_stats));
 	}
@@ -412,13 +414,27 @@ static void tbs5530_alp_stop(void *priv)
 		struct cxd2878_dev *cxd = dev->fe_ter->demodulator_priv;
 
 		cxd->alp_buf_len = 0;
+		cxd->ts_carry_len = 0;
 		cxd->alp_active = false;
 	}
+}
+
+/* /dev/alpraw%d L1 ioctl: read signalling from the demodulator. */
+static int tbs5530_alp_l1(void *priv, u32 what, u8 *buf, u32 len)
+{
+	struct tbs5530_dev *dev = priv;
+
+	BUILD_BUG_ON(ALP_RAW_L1_SNAPSHOT != CXD2878_L1_SNAPSHOT ||
+		     ALP_RAW_L1_DETAIL != CXD2878_L1_DETAIL);
+	if (!dev->fe_ter)
+		return -ENODEV;
+	return cxd2878_atsc3_get_l1(dev->fe_ter->demodulator_priv, what, buf, len);
 }
 
 static const struct alp_ops tbs5530_alp_ops = {
 	.open = tbs5530_alp_open,
 	.stop = tbs5530_alp_stop,
+	.l1   = tbs5530_alp_l1,
 };
 
 /* DVB stack setup */

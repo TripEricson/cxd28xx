@@ -1,0 +1,5 @@
+# cxd28xx alp.ko: /dev/alpraw<N> carries raw ATSC 3.0 ALP packets and L1
+# signalling from tuner adapter N. Same access as /dev/dvb: group "video".
+#   sudo make udev   (or copy to /etc/udev/rules.d/ and run
+#                     udevadm control --reload && udevadm trigger)
+SUBSYSTEM=="misc", KERNEL=="alpraw[0-9]*", GROUP="video", MODE="0660"

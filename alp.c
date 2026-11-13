@@ -6,6 +6,11 @@
  * Parses ALP headers, handles segmentation/concatenation, and injects
  * IPv4 payloads into the kernel network stack via a raw-ip net_device.
  *
+ * A character device, /dev/alpraw%d, delivers every complete top-level ALP
+ * packet unmodified (one per read(), see alp_raw.h), and serves L1
+ * signalling through an ioctl, so captures need no network privileges.
+ * utils/alp-capture writes them as pcap LINKTYPE_ATSC_ALP = 289.
+ *
  * Reference: ATSC A/330 Link-Layer Protocol
  */
 
@@ -15,13 +20,44 @@
 #include <linux/skbuff.h>
 #include <linux/ethtool.h>
 #include <linux/slab.h>
+#include <linux/miscdevice.h>
+#include <linux/kfifo.h>
+#include <linux/kref.h>
+#include <linux/poll.h>
+#include <linux/uaccess.h>
+#include <linux/rtnetlink.h>
+#include <linux/vmalloc.h>
+#include <linux/mm.h>
+#include <linux/timekeeping.h>
 
 #include "alp.h"
+#include "alp_raw.h"
+
+#define ALP_RAW_FIFO_SIZE	(8u << 20)	/* ~3 s at a full 6 MHz multiplex */
+#define ALP_RAW_REC_MAX		65535u		/* kfifo_rec_ptr_2 record limit */
+#define ALP_RAW_L1_MAX		16384u
 
 /* ── Internal structures ───────────────────────────────────────────── */
 
 struct alp_dev {
 	struct net_device   *netdev;
+	atomic_t             users;	/* alp%d + raw reader sharing the feed */
+	struct kref          ref;	/* held by alp_attach and open raw files */
+
+	/* /dev/alpraw%d */
+	struct miscdevice    raw_misc;
+	char                 raw_name[16];
+	bool                 raw_registered;
+	struct mutex         raw_lock;	/* reader claim/release, ioctl, detach */
+	struct mutex         raw_read_lock;
+	bool                 dead;	/* detached: hardware gone */
+	spinlock_t           raw_fifo_lock;	/* writer side + raw_reader */
+	bool                 raw_reader;	/* a file is reading */
+	struct kfifo_rec_ptr_2 raw_fifo;	/* alp_raw_hdr + packet records */
+	void                *raw_fifo_buf;
+	u8                  *raw_scratch;
+	u32                  raw_drops;
+	wait_queue_head_t    raw_wait;
 
 	/* Transport-layer callbacks */
 	const struct alp_ops *ops;
@@ -317,6 +353,43 @@ static void alp_handle_concatenated(struct alp_dev *alp, u8 packet_type,
 	}
 }
 
+/* ── Raw ALP tap (/dev/alpraw%d writer side) ──────────────────────── */
+
+/* Runs in the bridge's URB completion path: atomic context. */
+static void alp_tap_raw(struct alp_dev *alp, const u8 *buf, u32 len)
+{
+	struct alp_raw_hdr *h;
+	unsigned long flags;
+	u32 rec = sizeof(*h) + len;
+	bool queued = false;
+
+	if (!READ_ONCE(alp->raw_reader))
+		return;
+
+	spin_lock_irqsave(&alp->raw_fifo_lock, flags);
+	if (!alp->raw_reader)
+		goto out;
+	if (rec > ALP_RAW_REC_MAX) {
+		alp->raw_drops++;
+		goto out;
+	}
+	h = (struct alp_raw_hdr *)alp->raw_scratch;
+	h->tstamp_ns = ktime_get_real_ns();
+	h->len = len;
+	h->drops = alp->raw_drops;
+	memcpy(alp->raw_scratch + sizeof(*h), buf, len);
+	if (kfifo_in(&alp->raw_fifo, alp->raw_scratch, rec) == rec) {
+		alp->raw_drops = 0;
+		queued = true;
+	} else {
+		alp->raw_drops++;
+	}
+out:
+	spin_unlock_irqrestore(&alp->raw_fifo_lock, flags);
+	if (queued)
+		wake_up_interruptible(&alp->raw_wait);
+}
+
 /* ── ALP packet processing ─────────────────────────────────────────── */
 
 void alp_process(struct alp_dev *alp, const u8 *buf, u32 len)
@@ -330,6 +403,8 @@ void alp_process(struct alp_dev *alp, const u8 *buf, u32 len)
 
 	if (!alp || !alp->netdev)
 		return;
+
+	alp_tap_raw(alp, buf, len);
 
 	if (len < 2) {
 		alp->stats.short_packets++;
@@ -489,31 +564,50 @@ EXPORT_SYMBOL_GPL(alp_feed);
 
 /* ── Net device operations ─────────────────────────────────────────── */
 
+/*
+ * alp%d and the /dev/alpraw%d reader share one transport feed: it starts
+ * with the first user and stops with the last. Callers hold RTNL, which the
+ * bridges also take around their own feed changes.
+ */
+static int alp_feed_get(struct alp_dev *alp)
+{
+	int ret = 0;
+
+	ASSERT_RTNL();
+	if (atomic_read(&alp->users) == 0) {
+		if (alp->ops && alp->ops->open)
+			ret = alp->ops->open(alp->ops_priv);
+		if (ret)
+			return ret;
+		alp_seg_reset(alp);
+		memset(&alp->stats, 0, sizeof(alp->stats));
+	}
+	atomic_inc(&alp->users);
+	return 0;
+}
+
+static void alp_feed_put(struct alp_dev *alp)
+{
+	ASSERT_RTNL();
+	if (atomic_dec_and_test(&alp->users)) {
+		if (alp->ops && alp->ops->stop)
+			alp->ops->stop(alp->ops_priv);
+		alp_seg_reset(alp);
+	}
+}
+
 static int alp_open(struct net_device *netdev)
 {
 	struct alp_priv *priv = netdev_priv(netdev);
-	struct alp_dev *alp = priv->alp;
-	int ret = 0;
 
-	if (alp->ops && alp->ops->open)
-		ret = alp->ops->open(alp->ops_priv);
-	if (ret)
-		return ret;
-
-	alp_seg_reset(alp);
-	memset(&alp->stats, 0, sizeof(alp->stats));
-	return 0;
+	return alp_feed_get(priv->alp);
 }
 
 static int alp_stop(struct net_device *netdev)
 {
 	struct alp_priv *priv = netdev_priv(netdev);
-	struct alp_dev *alp = priv->alp;
 
-	if (alp->ops && alp->ops->stop)
-		alp->ops->stop(alp->ops_priv);
-
-	alp_seg_reset(alp);
+	alp_feed_put(priv->alp);
 	return 0;
 }
 
@@ -604,6 +698,236 @@ static void alp_setup(struct net_device *netdev)
 	netdev->needs_free_netdev = true;
 }
 
+/* ── /dev/alpraw%d ─────────────────────────────────────────────────── */
+
+struct alp_raw_file {
+	struct alp_dev *alp;
+	bool reader;
+};
+
+static void alp_free(struct kref *ref)
+{
+	struct alp_dev *alp = container_of(ref, struct alp_dev, ref);
+
+	vfree(alp->raw_fifo_buf);
+	kvfree(alp->raw_scratch);
+	kfree(alp->seg_buf);
+	kfree(alp);
+}
+
+/* Make this file the reader and start the feed. Process context. */
+static int alp_raw_claim(struct alp_raw_file *rf)
+{
+	struct alp_dev *alp = rf->alp;
+	unsigned long flags;
+	int ret = 0;
+
+	if (rf->reader)
+		return 0;
+	mutex_lock(&alp->raw_lock);
+	if (rf->reader)
+		goto out;
+	if (alp->dead) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (alp->raw_reader) {
+		ret = -EBUSY;
+		goto out;
+	}
+	if (!alp->raw_fifo_buf) {
+		void *fb = vmalloc(ALP_RAW_FIFO_SIZE);
+		u8 *sc = kvmalloc(ALP_RAW_REC_MAX, GFP_KERNEL);
+
+		if (!fb || !sc || kfifo_init(&alp->raw_fifo, fb, ALP_RAW_FIFO_SIZE)) {
+			vfree(fb);
+			kvfree(sc);
+			ret = -ENOMEM;
+			goto out;
+		}
+		alp->raw_fifo_buf = fb;
+		alp->raw_scratch = sc;
+	}
+	spin_lock_irqsave(&alp->raw_fifo_lock, flags);
+	kfifo_reset(&alp->raw_fifo);
+	alp->raw_drops = 0;
+	alp->raw_reader = true;
+	spin_unlock_irqrestore(&alp->raw_fifo_lock, flags);
+
+	rtnl_lock();
+	ret = alp_feed_get(alp);
+	rtnl_unlock();
+	if (ret) {
+		spin_lock_irqsave(&alp->raw_fifo_lock, flags);
+		alp->raw_reader = false;
+		spin_unlock_irqrestore(&alp->raw_fifo_lock, flags);
+		goto out;
+	}
+	rf->reader = true;
+out:
+	mutex_unlock(&alp->raw_lock);
+	return ret;
+}
+
+static int alp_raw_open(struct inode *inode, struct file *f)
+{
+	/* misc_open() hands us the miscdevice in private_data */
+	struct alp_dev *alp = container_of(f->private_data, struct alp_dev, raw_misc);
+	struct alp_raw_file *rf;
+
+	rf = kzalloc(sizeof(*rf), GFP_KERNEL);
+	if (!rf)
+		return -ENOMEM;
+	kref_get(&alp->ref);
+	rf->alp = alp;
+	f->private_data = rf;
+	return nonseekable_open(inode, f);
+}
+
+static int alp_raw_release(struct inode *inode, struct file *f)
+{
+	struct alp_raw_file *rf = f->private_data;
+	struct alp_dev *alp = rf->alp;
+	unsigned long flags;
+
+	if (rf->reader) {
+		mutex_lock(&alp->raw_lock);
+		spin_lock_irqsave(&alp->raw_fifo_lock, flags);
+		alp->raw_reader = false;
+		spin_unlock_irqrestore(&alp->raw_fifo_lock, flags);
+		if (!alp->dead) {
+			rtnl_lock();
+			alp_feed_put(alp);
+			rtnl_unlock();
+		}
+		mutex_unlock(&alp->raw_lock);
+	}
+	kfree(rf);
+	kref_put(&alp->ref, alp_free);
+	return 0;
+}
+
+static ssize_t alp_raw_read(struct file *f, char __user *ubuf, size_t count,
+			    loff_t *ppos)
+{
+	struct alp_raw_file *rf = f->private_data;
+	struct alp_dev *alp = rf->alp;
+	unsigned int copied;
+	int ret;
+
+	ret = alp_raw_claim(rf);
+	if (ret)
+		return ret;
+	if (mutex_lock_interruptible(&alp->raw_read_lock))
+		return -ERESTARTSYS;
+	while (kfifo_is_empty(&alp->raw_fifo)) {
+		if (READ_ONCE(alp->dead)) {
+			ret = -ENODEV;
+			goto out;
+		}
+		if (f->f_flags & O_NONBLOCK) {
+			ret = -EAGAIN;
+			goto out;
+		}
+		ret = wait_event_interruptible(alp->raw_wait,
+				!kfifo_is_empty(&alp->raw_fifo) || READ_ONCE(alp->dead));
+		if (ret)
+			goto out;
+	}
+	if (kfifo_peek_len(&alp->raw_fifo) > count) {
+		ret = -EMSGSIZE;
+		goto out;
+	}
+	ret = kfifo_to_user(&alp->raw_fifo, ubuf, count, &copied);
+	if (!ret)
+		ret = copied;
+out:
+	mutex_unlock(&alp->raw_read_lock);
+	return ret;
+}
+
+static __poll_t alp_raw_poll(struct file *f, poll_table *wait)
+{
+	struct alp_raw_file *rf = f->private_data;
+	struct alp_dev *alp = rf->alp;
+	__poll_t mask = 0;
+
+	if (alp_raw_claim(rf))
+		return EPOLLERR;
+	poll_wait(f, &alp->raw_wait, wait);
+	if (!kfifo_is_empty(&alp->raw_fifo))
+		mask |= EPOLLIN | EPOLLRDNORM;
+	else if (READ_ONCE(alp->dead))
+		mask |= EPOLLHUP | EPOLLERR;
+	return mask;
+}
+
+static long alp_raw_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+	struct alp_raw_file *rf = f->private_data;
+	struct alp_dev *alp = rf->alp;
+	struct alp_raw_l1 req;
+	u8 *kbuf;
+	u32 len;
+	int ret;
+
+	if (cmd != ALP_RAW_IOC_GET_L1)
+		return -ENOTTY;
+	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+		return -EFAULT;
+	if (!alp->ops || !alp->ops->l1)
+		return -EOPNOTSUPP;
+	len = min(req.len, ALP_RAW_L1_MAX);
+	kbuf = kvzalloc(len ? len : 1, GFP_KERNEL);
+	if (!kbuf)
+		return -ENOMEM;
+
+	mutex_lock(&alp->raw_lock);
+	ret = alp->dead ? -ENODEV : alp->ops->l1(alp->ops_priv, req.what, kbuf, len);
+	mutex_unlock(&alp->raw_lock);
+
+	if (ret >= 0) {
+		if (copy_to_user(u64_to_user_ptr(req.buf), kbuf, ret)) {
+			ret = -EFAULT;
+		} else {
+			req.len = ret;
+			ret = copy_to_user((void __user *)arg, &req, sizeof(req)) ? -EFAULT : 0;
+		}
+	}
+	kvfree(kbuf);
+	return ret;
+}
+
+static const struct file_operations alp_raw_fops = {
+	.owner		= THIS_MODULE,
+	.open		= alp_raw_open,
+	.release	= alp_raw_release,
+	.read		= alp_raw_read,
+	.poll		= alp_raw_poll,
+	.unlocked_ioctl	= alp_raw_ioctl,
+	.compat_ioctl	= compat_ptr_ioctl,
+};
+
+static void alp_raw_register(struct alp_dev *alp, struct device *parent)
+{
+	int ret;
+
+	/* same index as the alp%d net device */
+	snprintf(alp->raw_name, sizeof(alp->raw_name), "alpraw%s",
+		 alp->netdev->name + 3);
+	alp->raw_misc.minor = MISC_DYNAMIC_MINOR;
+	alp->raw_misc.name = alp->raw_name;
+	alp->raw_misc.fops = &alp_raw_fops;
+	alp->raw_misc.parent = parent;
+	alp->raw_misc.mode = 0660;
+	ret = misc_register(&alp->raw_misc);
+	if (ret)
+		dev_warn(parent, "alp: cannot register /dev/%s (%d)\n",
+			 alp->raw_name, ret);
+	else
+		alp->raw_registered = true;
+}
+
 /* ── Attach / detach ───────────────────────────────────────────────── */
 
 struct alp_dev *alp_attach(struct device *parent, const struct alp_ops *ops,
@@ -620,6 +944,11 @@ struct alp_dev *alp_attach(struct device *parent, const struct alp_ops *ops,
 
 	alp->ops = ops;
 	alp->ops_priv = ops_priv;
+	kref_init(&alp->ref);
+	mutex_init(&alp->raw_lock);
+	mutex_init(&alp->raw_read_lock);
+	spin_lock_init(&alp->raw_fifo_lock);
+	init_waitqueue_head(&alp->raw_wait);
 
 	alp->seg_buf = kmalloc(ALP_SEG_BUF_SIZE, GFP_KERNEL);
 	if (!alp->seg_buf) {
@@ -651,24 +980,52 @@ struct alp_dev *alp_attach(struct device *parent, const struct alp_ops *ops,
 		return ERR_PTR(ret);
 	}
 
-	dev_info(parent, "alp: net device %s registered\n", netdev->name);
+	/* Raw ALP character device; failure here is not fatal. */
+	alp_raw_register(alp, parent);
+
+	dev_info(parent, "alp: net device %s%s%s registered\n",
+		 alp->netdev->name, alp->raw_registered ? ", /dev/" : "",
+		 alp->raw_registered ? alp->raw_name : "");
 	return alp;
 }
 EXPORT_SYMBOL_GPL(alp_attach);
 
 void alp_detach(struct alp_dev *alp)
 {
+	unsigned long flags;
+
 	if (!alp)
 		return;
+
+	/* Stop delivering to /dev/alpraw%d and wake its reader; open files
+	 * keep alp alive (kref) and then see -ENODEV. */
+	mutex_lock(&alp->raw_lock);
+	alp->dead = true;
+	spin_lock_irqsave(&alp->raw_fifo_lock, flags);
+	alp->raw_reader = false;
+	spin_unlock_irqrestore(&alp->raw_fifo_lock, flags);
+	mutex_unlock(&alp->raw_lock);
+	wake_up_interruptible(&alp->raw_wait);
+	if (alp->raw_registered)
+		misc_deregister(&alp->raw_misc);
 
 	if (alp->netdev)
 		unregister_netdev(alp->netdev);
 	/* netdev freed by needs_free_netdev */
 
-	kfree(alp->seg_buf);
-	kfree(alp);
+	kref_put(&alp->ref, alp_free);
 }
 EXPORT_SYMBOL_GPL(alp_detach);
+
+/*
+ * True while alp%d is up or /dev/alpraw%d has a reader, i.e. while the
+ * transport feed should be running. Bridges use it to restore the feed after a frontend sleep.
+ */
+bool alp_feed_wanted(struct alp_dev *alp)
+{
+	return alp && atomic_read(&alp->users) > 0;
+}
+EXPORT_SYMBOL_GPL(alp_feed_wanted);
 
 struct net_device *alp_get_netdev(struct alp_dev *alp)
 {

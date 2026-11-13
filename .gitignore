@@ -39,3 +39,11 @@ CLAUDE.md
 .claude
 
 utils/atsc3-zap
+/atsc3-zap
+/alp-capture
+
+# Local test captures and reports
+*.pcap
+*.html
+*.txt
+__pycache__/

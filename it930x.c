@@ -22,6 +22,7 @@
 #include "cxd2878.h"
 #include "cxd2878_priv.h"
 #include "alp.h"
+#include "alp_raw.h"
 #include "it930x_smartcard.h"
 
 /* -------- IT930x bridge constants -------- */
@@ -2172,7 +2173,7 @@ static int it930x_fe_init(struct dvb_frontend *fe)
 		return ret;
 
 	rtnl_lock();
-	if (netif_running(alp_get_netdev(ife->alp)))
+	if (alp_feed_wanted(ife->alp))
 		it930x_alp_open(ife);
 	rtnl_unlock();
 
@@ -2381,6 +2382,7 @@ static int it930x_alp_open(void *priv)
 		struct cxd2878_dev *cxd = ife->fe->demodulator_priv;
 
 		cxd->alp_buf_len = 0;
+		cxd->ts_carry_len = 0;
 		cxd->alp_active = false;
 		memset(&cxd->alp_ts_stats, 0, sizeof(cxd->alp_ts_stats));
 	}
@@ -2403,13 +2405,27 @@ static void it930x_alp_stop(void *priv)
 		struct cxd2878_dev *cxd = ife->fe->demodulator_priv;
 
 		cxd->alp_buf_len = 0;
+		cxd->ts_carry_len = 0;
 		cxd->alp_active = false;
 	}
+}
+
+/* /dev/alpraw%d L1 ioctl: read signalling from the demodulator. */
+static int it930x_alp_l1(void *priv, u32 what, u8 *buf, u32 len)
+{
+	struct it930x_fe_ctx *ife = priv;
+
+	BUILD_BUG_ON(ALP_RAW_L1_SNAPSHOT != CXD2878_L1_SNAPSHOT ||
+		     ALP_RAW_L1_DETAIL != CXD2878_L1_DETAIL);
+	if (!ife->fe)
+		return -ENODEV;
+	return cxd2878_atsc3_get_l1(ife->fe->demodulator_priv, what, buf, len);
 }
 
 static const struct alp_ops it930x_alp_ops = {
 	.open = it930x_alp_open,
 	.stop = it930x_alp_stop,
+	.l1   = it930x_alp_l1,
 };
 
 /* -------- DVB registration -------- */

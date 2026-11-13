@@ -124,6 +124,15 @@ struct cxd2878_config{
 struct cxd2878_dev;
 struct alp_dev;
 
+/*
+ * ATSC 3.0 signalling readout (see cxd2878_atsc3_regs.h). Returns bytes
+ * written to buf, or -ENODATA (not tuned to ATSC 3.0), -EAGAIN (L1-Detail
+ * not decoded yet), -ENOSPC, -EIO. Sleeps; process context only.
+ */
+#define CXD2878_L1_SNAPSHOT	1	/* register snapshot, "CXA3" format */
+#define CXD2878_L1_DETAIL	2	/* raw A/322 L1-Detail bytes */
+int cxd2878_atsc3_get_l1(struct cxd2878_dev *dev, u32 what, u8 *buf, u32 len);
+
 /* ALP-div-TS decapsulation: feed raw USB buffer through CXD2878 TS parser */
 void cxd2878_alp_feed_raw(struct cxd2878_dev *dev, struct alp_dev *alp,
 			  const u8 *buf, u32 len);

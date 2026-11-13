@@ -2,6 +2,7 @@
 #define _CXD2878_PRIV_H_
 
 #include <linux/netdevice.h>
+
 #include <media/demux.h>
 #include <media/dvb_demux.h>
 #include <media/dvb_frontend.h>
@@ -367,6 +368,8 @@ struct cxd2878_dev {
 	bool                alp_carrier;
 	u8                  alp_buf[16384];
 	u32                 alp_buf_len;
+	u8                  ts_carry[188];    /* partial TS packet between buffers */
+	u32                 ts_carry_len;
 	bool                alp_active;
 	struct cxd2878_alp_ts_stats alp_ts_stats;
 

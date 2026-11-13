@@ -26,4 +26,13 @@
  * there is nothing left for this shim to compat-shim.
  */
 
+/*
+ * Stock kernels: the Makefile found no SYS_ATSC3 in the kernel's UAPI
+ * headers and passes the fallback value. Kernels that define the enum
+ * member never get this macro, so their real value is used.
+ */
+#ifdef CXD28XX_SYS_ATSC3_FALLBACK
+#define SYS_ATSC3 CXD28XX_SYS_ATSC3_FALLBACK
+#endif
+
 #endif /* _CXD28XX_COMPAT_H_ */

@@ -69,6 +69,9 @@ struct alp_stats {
 struct alp_ops {
 	int  (*open)(void *priv);
 	void (*stop)(void *priv);
+	/* optional: read L1 signalling (ALP_RAW_L1_*) into buf; returns
+	 * bytes or -errno. Process context, may sleep. */
+	int  (*l1)(void *priv, u32 what, u8 *buf, u32 len);
 };
 
 /**
@@ -122,5 +125,14 @@ u32 alp_feed(struct alp_dev *alp, const u8 *buf, u32 len);
  * Used by demod drivers for carrier on/off control.
  */
 struct net_device *alp_get_netdev(struct alp_dev *alp);
+
+/**
+ * alp_feed_wanted - Is alp%d up or /dev/alpraw%d being read?
+ * @alp: ALP device context (NULL-safe)
+ *
+ * The transport feed runs while this is true. Bridges call it to decide
+ * whether to restart the feed after a frontend sleep/wake cycle.
+ */
+bool alp_feed_wanted(struct alp_dev *alp);
 
 #endif /* _ALP_H_ */
