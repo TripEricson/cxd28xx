@@ -1,3 +1,26 @@
+# About this fork
+
+This fork of [majortom9/cxd28xx](https://github.com/majortom9/cxd28xx) (itself based on [koreapyj/cxd28xx](https://github.com/koreapyj/cxd28xx)) adds raw ATSC 3.0 capture for analysis tools such as [RENDER](https://github.com/TripEricson/render) and the [HDHomeRun TUI](https://github.com/TripEricson/hdhomerun_tui):
+
+- **`/dev/alpraw%d`**: a character device that delivers every top-level ALP packet unmodified, including the link-layer signalling (LMT) that the `alp%d` network interface drops, plus an ioctl for reading L1-Basic/L1-Detail.
+- **Adjustable USB transfer size** on the IT930x bridge, so a low-bitrate PLP decoded on its own (for example PLP 16) arrives in seconds instead of minutes. `alp-capture` sizes transfers automatically, and there's a `urb_packets` module parameter for the default.
+- **`utils/alp-capture`**: writes ALP-PCAP files (LINKTYPE 289) plus an HDHomeRun-style L1 `.txt` file. It can tune by itself (`-c` channel, `-p` PLPs), and without `-w` it names files like `rf25-20261111-085734-p0p1-alp.pcap`.
+- **`utils/alp-pcap-merge.py`**: combines captures of different PLPs from the same channel into one pcap.
+- **`utils/alp-pcap-check.py`** and **`utils/atsc3-l1.py`**: check captures and decode L1 signalling.
+
+### Setup
+make && make utils
+sudo cp 99-alpraw.rules /etc/udev/rules.d/
+sudo udevadm control --reload && sudo udevadm trigger
+sudo usermod -aG video $USER # then log out and back in
+./utils/alp-capture -c 25 -t 30 # 30-second capture of RF 25
+
+Testing was done with insmod, and DKMS has not yet been tested.
+
+See the commit history for details of each change. The original README follows.
+
+---
+
 # CXD28xx Linux DVB Driver
 
 Out-of-tree Linux kernel driver for the **Sony CXD28xx** series demodulator and associated tuners, supporting a wide range of broadcast standards.
